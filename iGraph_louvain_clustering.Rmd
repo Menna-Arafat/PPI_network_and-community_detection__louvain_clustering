@@ -1,0 +1,247 @@
+---
+title: "Applying louvain algorithm on PPI network to identify clusters/ communities of proteins interacting          with each other"
+author: "Menna Arafat"
+date:  "2024-8-31"
+output: html_document
+---
+
+
+
+
+## create output directory
+```{r}
+dir.create("output")
+```
+
+## load packages
+
+```{r}
+## BiocManager::install("estrogen")
+ suppressPackageStartupMessages({ 
+library(igraph)
+library(tidyr)
+library(readxl)
+library(openxlsx)
+library(org.Hs.eg.db)
+library(scales)
+library(ggplot2)
+library(tibble)
+library(dplyr)
+library(plyr)
+ })
+```
+
+## load data
+
+```{r}
+list.files()
+net= read.delim("data/ppi_1st_shell_50_blue.tsv")[,1:2]
+net=net[!grepl("ENS*|^LOC", net$X.node1) & !grepl("ENS*", net$node2),]
+```
+
+##  TO integrate ppi with TF networks
+```{r}
+##  tf_net= read.csv("jaspar_grey.csv")[,c(1,3)]
+##  tf= tf_net$ID
+##  names(tf_net)= names(net)
+##  net= rbind(net, tf_net)
+## --------------------------------
+## build igraph object from edge list
+```
+
+## create igraph object
+```{r}
+graph =graph_from_edgelist(net %>%as.matrix(), directed = FALSE)
+```
+
+## --------------------------------
+## Get hub proteins by applying centrality measures
+##  Degree Centrality, edges cconnected to a node
+
+```{r}
+degree_centrality <- igraph::degree(graph)  %>% sort(.,decreasing = T) 
+print(names(degree_centrality )[1:5])
+DC= names(degree_centrality)[1:5] %>% as.vector()
+```
+
+##  Betweenness Centrality, The number of shortest paths that pass through a vertex
+
+```{r}
+betweenness_centrality <- betweenness(graph, normalized = TRUE)  %>% sort(.,decreasing = T) 
+print(names(betweenness_centrality)[1:5])
+BC= names(betweenness_centrality)[1:5] %>% as.vector()
+```
+
+##  Eigenvector Centrality, The importance of a node based on the importance of its neighbors.
+
+```{r}
+eigenvector_centrality <- eigen_centrality(graph)$vector %>% sort(.,decreasing = T) 
+print(eigenvector_centrality) %>% head()
+eigc= names(eigenvector_centrality)[1:5] %>% as.vector()
+```
+
+## closeness centrality
+
+```{r}
+closeness_centrality= closeness(graph) %>% sort(.,decreasing = T)
+closeness_centrality %>% head()
+cc= names(closeness_centrality)[1:5] %>% as.vector()
+```
+
+##  PageRank,Nodes are considered important if they are linked to by other important nodes, with a damping factor accounting for random jumps.
+
+```{r}
+pagerank <- page_rank(graph)$vector %>% sort(.,decreasing = T) 
+pagerank %>% head()
+pr= names(pagerank)[1:5] %>% as.vector()
+
+all_drivers= c(DC, BC, eigc, cc, pr ) %>% unique()
+all_drivers
+```
+
+## visualization
+##  col <- colorRampPalette(c("#F6E8C3", "#1FA187FF")) 
+##  col(10)
+##  Create a color vector, defaulting to black
+
+```{r}
+node_colors <- rep("gray80", vcount(graph))
+```
+
+##  Set the color of specific nodes to red
+
+```{r}
+node_colors[V(graph)$name %in% all_drivers] <- "orange"
+## node_colors[V(graph)$name %in% tf] <- "#1FA187FF"
+
+node_colors
+```
+
+## function to change label position (stackoverflow)
+
+```{r}
+radian.rescale <- function(x, start=0, direction=1) {
+  c.rotate <- function(x) (x + start) %% (2 * pi) * direction
+  c.rotate(scales::rescale(x, c(0, 2 * pi), range(x)))
+}
+n= vcount(graph)
+lab.locs <- radian.rescale(x=1:n, direction=-1, start=0)
+
+
+png("output/igraph_ppi_network.png", width=20000, height=20000, res= 1000)
+plot(graph, edge.arrow.size=.5, vertex.color= node_colors, vertex.size=5, 
+     vertex.frame.color="gray", vertex.label.color="black", 
+     vertex.label.cex=1, vertex.label.dist= 1.2, vertex.label.degree=lab.locs,
+     layout=layout_in_circle, #' ## layout_with_fr
+     main="PPI Networks for blue Module") 
+
+dev.off()
+```
+
+## ------------------------------
+## Cluster modularity (louvain)
+
+```{r}
+clusterlouvain <- cluster_louvain(graph)
+clusterleiden = cluster_leiden(graph, objective_function = "modularity", n_iteration=10)
+```
+
+## see the distance between clustering of two algorithms whaere small distance indicate hat those algorithms gave more similar results
+
+```{r}
+compare(clusterlouvain, clusterleiden)
+```
+
+## group1 <- V(graph)$name[which(clusterlouvain$membership == 1)]
+## export communities
+
+```{r}
+communities= communities(clusterlouvain)
+communities
+communities= ldply(communities, rbind) %>% t()
+communities[is.na(communities)]= ""
+communities= communities %>% as.data.frame()
+names(communities)= paste0("cluster", 1:length(communities))
+communities
+## write.xlsx(communities, "communities_louvain_blue.xlsx", rowNames= F)
+```
+
+## ----------------------
+## to draw communities splitted for visualization
+
+```{r}
+coGrph <- delete_edges(graph, E(graph)[igraph::crossing(clusterlouvain, graph)])
+plot(coGrph)
+```
+
+## ?crossing
+## Stretch = 20
+
+```{r}
+col= grDevices::adjustcolor(c("pink", "#B0E0E6", "#BF812D", "#46337EFF"), alpha=0.3) 
+```
+
+#Apply enrichment analysis for each protein cluster then annotate clustere using the mostnlikely term/ biological process
+## read the output file of functional enrichment using clusterprofiler
+
+```{r}
+terms= read.xlsx("data/communities_louvain_blue.xlsx", sheet= "term")
+```
+
+## adjust layout
+
+```{r}
+layout <- layout_with_kk(coGrph)
+```
+
+##  Calculate centroids for each community
+
+```{r}
+centroids <- sapply(1:4, function(i) {
+  colMeans(layout[clusterlouvain$membership == i, ])
+}) %>% t()
+
+png("output/ppi_communities_louvain.png", width=14000, height=11800, res=1000)
+plot(graph, layout=layout_with_kk(coGrph) ,
+     vertex.color= clusterlouvain$membership, vertex.size=5, 
+     vertex.label.color="black", 
+     vertex.label.cex=1, vertex.label.dist= 1.2,
+     mark.groups = communities(clusterlouvain), #' ## list(group1,group2, group3, group4),
+     mark.shape=1, 
+     mark.col=col,
+     mark.border= col,
+     mark.expand = 30)
+text(x= c(centroids[,1][1]*.39, centroids[,1][2]*.1, centroids[,1][3]*.2, centroids[,1][4]*.15),
+     y= c(centroids[,2][1]*.37, centroids[,2][2]*.3, centroids[,2][3]*.35, centroids[,2][4]*.31),
+    labels = terms$term, col = "black", cex = 1.1)
+
+dev.off()
+```
+
+## -----------------------------------------------------------------------------------
+## -----------------------------------------------------------------------------------
+## -----------------------------------------------------------------------------------
+## -----------------------------------------------------------------------------------
+###### play with some igraph functions
+
+
+```{r}
+graph[]
+get.adjacency(net, attr="weight", sparse=F)
+
+## all vertices
+V(graph)$name
+
+
+## all edges
+E(graph)
+
+## get neighbours
+n= neighborhood(graph, order=1, V(graph)$name %in% c( "APCS", "SERPINA3","A1BG" ))
+names(unlist(n))    
+
+
+## get edges between certain node and another node, and their count/length         
+E(graph)[ V(graph)[name=="SERPINA3" ] %--% V(graph)[name=="A1BG"] ] %>% length()   
+```
+
